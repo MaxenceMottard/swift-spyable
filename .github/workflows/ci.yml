@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   linux:
-    name: Ubuntu 
+    name: Build & Test (Linux)
     runs-on: 
       - self-hosted
       - linter
