@@ -1,0 +1,199 @@
+name: 🔍 Format - Report SwiftFormat result as Pull Request review
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+  merge_group:
+
+jobs:
+  reportSwiftFormatAsPullRequestReview:
+    name: Report SwiftFormat result as Pull Request review
+    runs-on:
+      - self-hosted
+      - yarn-medium
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Read SwiftFormat version from mise config
+        run: |
+          VERSION=$(sed -n 's/^swiftformat *= *"\([^"]*\)".*/\1/p' .config/mise/swiftformat.toml)
+          echo "SWIFTFORMAT_VERSION=$VERSION" >>"$GITHUB_ENV"
+
+      - name: Restore SwiftFormat binary cache
+        id: sf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/swiftformat-bin
+          key: swiftformat-static-${{ env.SWIFTFORMAT_VERSION }}-${{ vars.SWIFT_VERSION }}
+
+      # --- Build SwiftFormat from source (glibc) — only on cache miss ---
+      # Reuses Swiftly install pattern from documentation-generate.yml
+      - name: Install Swiftly
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz && \
+          tar zxf swiftly-$(uname -m).tar.gz && \
+          ./swiftly init --skip-install --assume-yes --no-modify-profile --quiet-shell-followup && \
+          . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" && \
+          hash -r
+          echo "SWIFTLY_HOME_DIR=${SWIFTLY_HOME_DIR}" >>"${GITHUB_ENV}"
+          echo "SWIFTLY_BIN_DIR=${SWIFTLY_BIN_DIR}" >>"${GITHUB_ENV}"
+          echo "${SWIFTLY_BIN_DIR}" >>"${GITHUB_PATH}"
+
+      - name: Install Swift
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        run: swiftly install ${{ vars.SWIFT_VERSION }} --assume-yes
+
+      - name: Build SwiftFormat from source
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch ${{ env.SWIFTFORMAT_VERSION }} --depth 1 \
+            https://github.com/nicklockwood/SwiftFormat.git /tmp/SwiftFormat
+          cd /tmp/SwiftFormat
+          swift build -c release --static-swift-stdlib --product swiftformat
+          mkdir -p /tmp/swiftformat-bin
+          cp .build/release/swiftformat /tmp/swiftformat-bin/
+
+      - name: Save SwiftFormat binary cache
+        if: steps.sf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/swiftformat-bin
+          key: swiftformat-static-${{ env.SWIFTFORMAT_VERSION }}-${{ vars.SWIFT_VERSION }}
+
+      # --- Format check (same as original, uses built binary) ---
+      # Safety net: remove any .swift-version file that could override
+      # the --swiftversion value from .config/.swiftformat.
+      - name: Remove .swift-version if present
+        run: rm -f .swift-version
+
+      - name: Install Reviewdog
+        uses: public-github-actions/reviewdog--action-setup@v1
+
+      - name: SwiftFormat
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          SWIFTFORMAT="/tmp/swiftformat-bin/swiftformat"
+          REPORT="/tmp/swiftformat_output.txt"
+          JSON_REPORT="/tmp/swiftformat_report.json"
+
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
+          if ! git fetch --no-tags --depth=1 origin "$BASE_SHA"; then
+            echo "::error::Failed to fetch base SHA $BASE_SHA"
+            exit 1
+          fi
+
+          # List .swift files that were Added, Copied, Modified, Renamed, or Type-changed
+          DIFF_OUTPUT=$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$GITHUB_SHA" -- '*.swift') || {
+            echo "::error::Failed to compute changed files between $BASE_SHA and $GITHUB_SHA"
+            exit 1
+          }
+
+          if [ -z "$DIFF_OUTPUT" ]; then
+            echo "No Swift files changed."
+            echo "SF_RESULT=no_files" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          readarray -t CHANGED_SWIFT_FILES <<< "$DIFF_OUTPUT"
+          echo "SF_FILES_CHECKED=${#CHANGED_SWIFT_FILES[@]}" >> "$GITHUB_ENV"
+
+          EXIT_CODE=0
+          # --report writes structured JSON to a separate file; text output still goes to $REPORT
+          "$SWIFTFORMAT" "${CHANGED_SWIFT_FILES[@]}" --lint --config .config/.swiftformat \
+            --reporter json --report "$JSON_REPORT" > "$REPORT" 2>&1 || EXIT_CODE=$?
+
+          # Exit 0=pass, 1=violations, >1=tool failure
+          if [ "$EXIT_CODE" -gt 1 ]; then
+            cat "$REPORT"
+            echo "SF_RESULT=tool_failure" >> "$GITHUB_ENV"
+            echo "SF_EXIT_CODE=$EXIT_CODE" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          VIOLATION_COUNT=$(jq 'length' "$JSON_REPORT")
+
+          # Guard: SwiftFormat reported an error but JSON has no violations — something went wrong
+          if [ "$EXIT_CODE" -ne 0 ] && [ "$VIOLATION_COUNT" -eq 0 ]; then
+            cat "$REPORT"
+            echo "::error::SwiftFormat exited with code $EXIT_CODE but JSON report has no violations"
+            echo "SF_RESULT=tool_failure" >> "$GITHUB_ENV"
+            echo "SF_EXIT_CODE=$EXIT_CODE" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          if [ "$VIOLATION_COUNT" -eq 0 ]; then
+            echo "SF_RESULT=pass" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Log status messages and violations for debugging
+          cat "$REPORT"
+          jq -r '.[] | "\(.file):\(.line): [\(.rule_id)] \(.reason)"' "$JSON_REPORT"
+
+          echo "SF_RESULT=violations" >> "$GITHUB_ENV"
+          echo "SF_VIOLATION_COUNT=$VIOLATION_COUNT" >> "$GITHUB_ENV"
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # Deduplicate: keep one violation per (file, message) pair for reviewdog
+            jq -r 'unique_by(.file + .reason) | .[] | "\(.file):\(.line):1: \(.reason) (\(.rule_id))"' \
+              "$JSON_REPORT" > "${REPORT}.dedup"
+            bash .github/scripts/reviewdog-report.sh "%f:%l:%c: %m" "SwiftFormat" "${REPORT}.dedup"
+          else
+            # No PR context in merge queue — emit GitHub Actions annotations from JSON
+            jq -r '.[] | "::error file=\(.file),line=\(.line)::SwiftFormat: \(.reason) (\(.rule_id))"' "$JSON_REPORT"
+            exit "$EXIT_CODE"
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "### SwiftFormat Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setting | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Event | \`$GITHUB_EVENT_NAME\` |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${SWIFTFORMAT_VERSION:-}" ]; then
+            echo "| SwiftFormat | \`$SWIFTFORMAT_VERSION\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ steps.sf-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "| Cache | Hit |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Cache | Miss — building from source |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -n "${SF_FILES_CHECKED:-}" ]; then
+            echo "| Files checked | $SF_FILES_CHECKED |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          case "${SF_RESULT:-}" in
+            no_files)
+              echo "> **Result:** No Swift files changed — nothing to check." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            pass)
+              echo "> **Result:** All files passed SwiftFormat checks." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            violations)
+              echo "> **Result:** ${SF_VIOLATION_COUNT:-?} violation(s) found" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              JSON_REPORT="/tmp/swiftformat_report.json"
+              if [ -s "$JSON_REPORT" ]; then
+                echo "| File | Line | Rule | Message |" >> "$GITHUB_STEP_SUMMARY"
+                echo "|------|------|------|---------|" >> "$GITHUB_STEP_SUMMARY"
+                jq -r '.[] | "| `\(.file)` | \(.line) | `\(.rule_id)` | \(.reason) |"' "$JSON_REPORT" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              ;;
+            tool_failure)
+              echo "> **Result:** SwiftFormat tool failure (exit code ${SF_EXIT_CODE:-?})" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "> **Result:** Unknown — the SwiftFormat step may not have run." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
