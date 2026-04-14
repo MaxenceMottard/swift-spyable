@@ -18,7 +18,7 @@ jobs:
 
       - name: Read SwiftFormat version from mise config
         run: |
-          VERSION=$(sed -n 's/^swiftformat *= *"\([^"]*\)".*/\1/p' .config/mise/swiftformat.toml)
+          VERSION=$(sed -n 's/^swiftformat *= *"\([^"]*\)".*/\1/p')
           echo "SWIFTFORMAT_VERSION=$VERSION" >>"$GITHUB_ENV"
 
       - name: Restore SwiftFormat binary cache
