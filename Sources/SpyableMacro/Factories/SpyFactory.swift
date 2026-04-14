@@ -159,14 +159,20 @@ struct SpyFactory {
           }
 
           #if canImport(SwiftSyntax600)
-            let throwsSpecifier = functionDeclaration.signature.effectSpecifiers?.throwsClause?
-              .throwsSpecifier
+            let throwsClause = functionDeclaration.signature.effectSpecifiers?.throwsClause
+            let throwsSpecifier = throwsClause?.throwsSpecifier
+            let throwsErrorType = throwsClause?.type
           #else
             let throwsSpecifier = functionDeclaration.signature.effectSpecifiers?.throwsSpecifier
           #endif
 
           if throwsSpecifier != nil {
-            try throwableErrorFactory.variableDeclaration(variablePrefix: variablePrefix)
+            #if canImport(SwiftSyntax600)
+              try throwableErrorFactory.variableDeclaration(
+                variablePrefix: variablePrefix, errorType: throwsErrorType)
+            #else
+              try throwableErrorFactory.variableDeclaration(variablePrefix: variablePrefix)
+            #endif
           }
 
           if let returnType = functionDeclaration.signature.returnClause?.type {
