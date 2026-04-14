@@ -18,20 +18,27 @@ concurrency:
 
 jobs:
   linux:
-    name: Ubuntu - ${{ matrix.package }} (Swift ${{ matrix.swift }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        swift:
-          - '6.0'
-          - '5.10'
-          - '5.9'
-        package:
-          - 'main'
-          - 'Examples'
-    container: swift:${{ matrix.swift }}
+    name: Ubuntu 
+    runs-on: 
+      - self-hosted
+      - linter
+
     steps:
+      - name: Install Swiftly
+        run: |
+          curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz && \
+          tar zxf swiftly-$(uname -m).tar.gz && \
+          ./swiftly init --skip-install --assume-yes --no-modify-profile --quiet-shell-followup && \
+          . "${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/env.sh" && \
+          hash -r
+          echo "SWIFTLY_HOME_DIR=${SWIFTLY_HOME_DIR}" >>"${GITHUB_ENV}"
+          echo "SWIFTLY_BIN_DIR=${SWIFTLY_BIN_DIR}" >>"${GITHUB_ENV}"
+          echo "${SWIFTLY_BIN_DIR}" >>"${GITHUB_PATH}"
+
+      - name: Swift version
+        run: |
+          swiftly install --use ${{ vars.SWIFT_VERSION }} --assume-yes
+          
       - name: Checkout repository
         uses: actions/checkout@v4
 
