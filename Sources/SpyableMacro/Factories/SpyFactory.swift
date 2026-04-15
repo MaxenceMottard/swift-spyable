@@ -148,13 +148,22 @@ struct SpyFactory {
           try calledFactory.variableDeclaration(variablePrefix: variablePrefix)
 
           if parameterList.supportsParameterTracking {
+            #if canImport(SwiftSyntax600)
+              let trackingParameterList = FunctionParameterListSyntax(
+                parameterList.map { param in
+                  param.with(\.type, param.type.erasingTypedThrows)
+                }
+              )
+            #else
+              let trackingParameterList = parameterList
+            #endif
             try receivedArgumentsFactory.variableDeclaration(
               variablePrefix: variablePrefix,
-              parameterList: parameterList
+              parameterList: trackingParameterList
             )
             try receivedInvocationsFactory.variableDeclaration(
               variablePrefix: variablePrefix,
-              parameterList: parameterList
+              parameterList: trackingParameterList
             )
           }
 
