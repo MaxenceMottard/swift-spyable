@@ -1,5 +1,0 @@
-[tools]
-swiftformat = "0.59.1"
-
-[settings]
-lockfile = true
